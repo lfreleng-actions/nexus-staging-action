@@ -42,6 +42,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Run action with invalid mode (expect failure)'
         id: invalid-mode
@@ -80,6 +82,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Run action with missing m2repo (expect failure)'
         id: missing-m2repo
@@ -119,6 +123,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Run action with missing staging-repo-id (expect failure)'
         id: missing-repo-id
@@ -161,6 +167,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Validate action.yaml structure'
         shell: bash
@@ -222,6 +230,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Start mock Nexus server'
         shell: bash
