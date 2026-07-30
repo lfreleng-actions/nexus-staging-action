@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Pin the ruff rule set explicitly.
+#
+# Without a `select`, ruff applies its *default* rule set, and that
+# default is not stable across releases:
+#
+#     ruff 0.15.22 ->  59 rules across  2 categories (E, F)
+#     ruff 0.16.0  -> 413 rules across 38 categories
+#
+# A routine pre-commit autoupdate crossing that boundary changed which
+# rules run and broke repositories across this organisation, on code
+# nobody had touched.  Here it surfaced seven findings in
+# tests/mock_nexus.py: EXE001, three RUF100 and three UP032.
+#
+# The selection below is the widest set this repository already
+# satisfies, so pinning changes no behaviour today.  It is a subset of
+# the organisation superset ("E", "W", "F", "I", "B", "C4", "UP"), short
+# only by "UP".
+#
+# "UP" is omitted because UP032 flags three `"...".format(...)` calls in
+# tests/mock_nexus.py that would need rewriting as f-strings.  The fix is
+# mechanical and worth doing, but it is a code change and belongs in its
+# own reviewed pull request rather than riding along with a version bump.
+#
+# Note that this pins the rule set at CATEGORY level, not rule level.
+# Ruff selectors are prefixes, so a future release adding new E* or F*
+# rules would enable them here automatically.  Pinning every rule code
+# individually would be exhaustive and unmaintainable; the aim is to
+# bound the blast radius, reducing "413 rules across 38 categories"
+# back to six, not to freeze the set outright.
+#
+# `line-length` and `target-version` are intentionally left unset so
+# ruff's own defaults continue to apply unchanged.
+
+[lint]
+select = ["E", "W", "F", "I", "B", "C4"]
+
+ignore = [
+  "E501", # line-too-long: the formatter owns line length
+]
+
+[lint.per-file-ignores]
+# Test suites legitimately break rules that matter in library code.
+#
+# None of these codes is reachable under the current `select`.  They are
+# listed anyway so that a later widening, to "S", "ARG" or "PL", does not
+# immediately flag every test module.  PLR0917 is the concrete case
+# already seen elsewhere in this organisation: tests stacking @patch
+# decorators cannot satisfy it, because unittest.mock injects its mocks
+# positionally, so a keyword-only signature is impossible rather than
+# merely inconvenient.
+"tests/**/*.py" = ["S101", "ARG", "PLR0913", "PLR0917", "PLR2004"]
