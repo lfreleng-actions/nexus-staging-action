@@ -41,7 +41,7 @@ jobs:
           egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -61,12 +61,14 @@ jobs:
         run: |
           # SPDX-License-Identifier: Apache-2.0
           set -euo pipefail
-          if [ "${{ steps.invalid-mode.outcome }}" != "failure" ]; then
+          if [ "${STEPS_INVALID_MODE_OUTCOME}" != "failure" ]; then
             echo "::error::Expected failure for invalid" \
-              "mode, got: ${{ steps.invalid-mode.outcome }}"
+              "mode, got: ${STEPS_INVALID_MODE_OUTCOME}"
             exit 1
           fi
           echo "PASS: Invalid mode correctly rejected"
+        env:
+          STEPS_INVALID_MODE_OUTCOME: ${{ steps.invalid-mode.outcome }}
 
   test-missing-m2repo:
     name: 'Test: Missing m2repo fails'
@@ -81,7 +83,7 @@ jobs:
           egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -102,12 +104,14 @@ jobs:
         run: |
           # SPDX-License-Identifier: Apache-2.0
           set -euo pipefail
-          if [ "${{ steps.missing-m2repo.outcome }}" != "failure" ]; then
+          if [ "${STEPS_MISSING_M2REPO_OUTCOME}" != "failure" ]; then
             echo "::error::Expected failure for missing" \
-              "m2repo, got: ${{ steps.missing-m2repo.outcome }}"
+              "m2repo, got: ${STEPS_MISSING_M2REPO_OUTCOME}"
             exit 1
           fi
           echo "PASS: Missing m2repo correctly rejected"
+        env:
+          STEPS_MISSING_M2REPO_OUTCOME: ${{ steps.missing-m2repo.outcome }}
 
   test-missing-staging-repo-id:
     name: 'Test: Missing staging-repo-id fails'
@@ -122,7 +126,7 @@ jobs:
           egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -145,13 +149,15 @@ jobs:
         run: |
           # SPDX-License-Identifier: Apache-2.0
           set -euo pipefail
-          if [ "${{ steps.missing-repo-id.outcome }}" != "failure" ]; then
+          if [ "${STEPS_MISSING_REPO_ID_OUTCOME}" != "failure" ]; then
             echo "::error::Expected failure for missing" \
               "staging-repo-id," \
-              "got: ${{ steps.missing-repo-id.outcome }}"
+              "got: ${STEPS_MISSING_REPO_ID_OUTCOME}"
             exit 1
           fi
           echo "PASS: Missing staging-repo-id correctly rejected"
+        env:
+          STEPS_MISSING_REPO_ID_OUTCOME: ${{ steps.missing-repo-id.outcome }}
 
   test-action-structure:
     name: 'Test: Action structure valid'
@@ -166,7 +172,7 @@ jobs:
           egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -229,7 +235,7 @@ jobs:
           egress-policy: 'audit'
 
       # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -299,9 +305,11 @@ jobs:
           fi
 
           # 3. The action step itself must have succeeded.
-          if [ "${{ steps.release.outcome }}" != "success" ]; then
+          if [ "${STEPS_RELEASE_OUTCOME}" != "success" ]; then
             echo "::error::release step failed"
             exit 1
           fi
 
           echo "PASS: release flow matches lftools nexus release"
+        env:
+          STEPS_RELEASE_OUTCOME: ${{ steps.release.outcome }}
