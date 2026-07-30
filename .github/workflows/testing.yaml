@@ -58,12 +58,14 @@ jobs:
 
       - name: 'Verify failure'
         shell: bash
+        env:
+          INVALID_MODE_OUTCOME: ${{ steps.invalid-mode.outcome }}
         run: |
           # SPDX-License-Identifier: Apache-2.0
           set -euo pipefail
-          if [ "${{ steps.invalid-mode.outcome }}" != "failure" ]; then
+          if [ "$INVALID_MODE_OUTCOME" != "failure" ]; then
             echo "::error::Expected failure for invalid" \
-              "mode, got: ${{ steps.invalid-mode.outcome }}"
+              "mode, got: $INVALID_MODE_OUTCOME"
             exit 1
           fi
           echo "PASS: Invalid mode correctly rejected"
@@ -99,12 +101,14 @@ jobs:
 
       - name: 'Verify failure'
         shell: bash
+        env:
+          MISSING_M2REPO_OUTCOME: ${{ steps.missing-m2repo.outcome }}
         run: |
           # SPDX-License-Identifier: Apache-2.0
           set -euo pipefail
-          if [ "${{ steps.missing-m2repo.outcome }}" != "failure" ]; then
+          if [ "$MISSING_M2REPO_OUTCOME" != "failure" ]; then
             echo "::error::Expected failure for missing" \
-              "m2repo, got: ${{ steps.missing-m2repo.outcome }}"
+              "m2repo, got: $MISSING_M2REPO_OUTCOME"
             exit 1
           fi
           echo "PASS: Missing m2repo correctly rejected"
@@ -142,13 +146,15 @@ jobs:
 
       - name: 'Verify failure'
         shell: bash
+        env:
+          MISSING_REPO_ID_OUTCOME: ${{ steps.missing-repo-id.outcome }}
         run: |
           # SPDX-License-Identifier: Apache-2.0
           set -euo pipefail
-          if [ "${{ steps.missing-repo-id.outcome }}" != "failure" ]; then
+          if [ "$MISSING_REPO_ID_OUTCOME" != "failure" ]; then
             echo "::error::Expected failure for missing" \
               "staging-repo-id," \
-              "got: ${{ steps.missing-repo-id.outcome }}"
+              "got: $MISSING_REPO_ID_OUTCOME"
             exit 1
           fi
           echo "PASS: Missing staging-repo-id correctly rejected"
@@ -266,6 +272,8 @@ jobs:
 
       - name: 'Assert request flow'
         shell: bash
+        env:
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
         run: |
           # SPDX-License-Identifier: Apache-2.0
           set -euo pipefail
@@ -299,7 +307,7 @@ jobs:
           fi
 
           # 3. The action step itself must have succeeded.
-          if [ "${{ steps.release.outcome }}" != "success" ]; then
+          if [ "$RELEASE_OUTCOME" != "success" ]; then
             echo "::error::release step failed"
             exit 1
           fi
