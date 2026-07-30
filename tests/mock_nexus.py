@@ -57,18 +57,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         _ = self.wfile.write(payload)
 
-    def do_GET(self) -> None:  # noqa: N802 (http.server API)
-        _log("GET {}".format(self.path))
+    def do_GET(self) -> None:
+        _log(f"GET {self.path}")
         if self.path.endswith("/activity"):
             xml = RELEASED_XML if STATE["released"] else CLOSED_XML
             self._send(200, xml, "application/xml")
         else:
             self._send(404, "<error/>", "application/xml")
 
-    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8") if length else ""
-        _log("POST {} BODY {}".format(self.path, body))
+        _log(f"POST {self.path} BODY {body}")
         if self.path.endswith("/staging/bulk/promote"):
             try:
                 data = json.loads(body)  # pyright: ignore[reportAny]
@@ -84,14 +84,14 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "<error/>", "application/xml")
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002  # pyright: ignore[reportImplicitOverride]
+    def log_message(self, format: str, *args: object) -> None:  # pyright: ignore[reportImplicitOverride]
         return
 
 
 def main() -> None:
     open(LOG, "w", encoding="utf-8").close()
     server = HTTPServer(("127.0.0.1", PORT), Handler)
-    print("mock-nexus listening on {}".format(PORT), flush=True)
+    print(f"mock-nexus listening on {PORT}", flush=True)
     server.serve_forever()
 
 
