@@ -40,15 +40,10 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: 'Run action with invalid mode (expect failure)'
         id: invalid-mode
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           nexus-server: 'https://nexus.example.org'
           nexus-username: 'test-user'
@@ -82,15 +77,10 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: 'Run action with missing m2repo (expect failure)'
         id: missing-m2repo
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           nexus-server: 'https://nexus.example.org'
           nexus-username: 'test-user'
@@ -125,15 +115,10 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: 'Run action with missing staging-repo-id (expect failure)'
         id: missing-repo-id
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           nexus-server: 'https://nexus.example.org'
           nexus-username: 'test-user'
@@ -261,7 +246,7 @@ jobs:
 
       - name: 'Run action in release mode against mock'
         id: release
-        uses: ./
+        uses: $/
         with:
           nexus-server: 'http://127.0.0.1:8089'
           nexus-username: 'mock-user'
