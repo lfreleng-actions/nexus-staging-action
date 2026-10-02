@@ -16,8 +16,9 @@ dependency required.
 
 ## Features
 
-- **Stage**: Create staging repo, upload Maven artifacts, close for validation
-- **Close**: Close an existing staging repository
+- **Stage**: Create staging repo, upload Maven artifacts, close it and wait
+  for Nexus to finish validating it
+- **Close**: Close an existing staging repository and wait for the result
 - **Release**: Release a closed staging repository to the releases repository
   (the `promote` mode name is a deprecated alias for `release`)
 - **Drop**: Drop/delete a staging repository (cleanup on failure)
@@ -29,18 +30,22 @@ dependency required.
 
 ## Nexus 2 REST API Reference
 
+<!-- markdownlint-disable MD013 -->
+
 | Operation | Method | Endpoint                                                       |
 | --------- | ------ | -------------------------------------------------------------- |
 | Create    | POST   | `/service/local/staging/profiles/{profile-id}/start`           |
 | Upload    | PUT    | `/service/local/staging/deployByRepositoryId/{repo-id}/{path}` |
 | Close     | POST   | `/service/local/staging/profiles/{profile-id}/finish`          |
+| Status    | GET    | `/service/local/staging/repository/{repo-id}`                  |
 | Verify    | GET    | `/service/local/staging/repository/{repo-id}/activity`         |
 | Release   | POST   | `/service/local/staging/bulk/promote`                          |
 | Drop      | POST   | `/service/local/staging/profiles/{profile-id}/drop`            |
 
 <!-- markdownlint-enable MD013 MD060 -->
 
-Close and drop use XML payloads:
+Close and drop use XML payloads. The action escapes the XML special
+characters `& < > " '` in `description` before sending it:
 
 ```xml
 <promoteRequest><data>
@@ -165,18 +170,24 @@ jobs:
 
 <!-- markdownlint-disable MD013 MD060 -->
 
-| Input                | Description                                                     | Required | Default                  |
-| -------------------- | --------------------------------------------------------------- | -------- | ------------------------ |
-| `nexus-server`       | Nexus server URL (e.g., `https://nexus.opendaylight.org`)       | ✅        | —                        |
-| `nexus-username`     | Nexus username for authentication                               | ✅        | —                        |
-| `nexus-password`     | Nexus password for authentication                               | ✅        | —                        |
-| `staging-profile-id` | Nexus staging profile ID (per-project)                          | ✅        | —                        |
-| `mode`               | Operation mode: `stage`, `close`, `release`, `drop`             | ✅        | `stage`                  |
-| `m2repo-path`        | Path to local Maven repo directory (for `stage` mode)           | ❌        | `m2repo`                 |
-| `staging-repo-id`    | Existing staging repo ID (for `close`/`release`/`drop`)         | ❌        | —                        |
-| `description`        | Description for the staging repository                          | ❌        | `GitHub Actions staging` |
+| Input                 | Description                                               | Required | Default                  |
+| --------------------- | --------------------------------------------------------- | -------- | ------------------------ |
+| `nexus-server`        | Nexus server URL (e.g., `https://nexus.opendaylight.org`) | ✅       | —                        |
+| `nexus-username`      | Nexus username for authentication                         | ✅       | —                        |
+| `nexus-password`      | Nexus password for authentication                         | ✅       | —                        |
+| `staging-profile-id`  | Nexus staging profile ID (per-project)                    | ✅       | —                        |
+| `mode`                | Operation mode: `stage`, `close`, `release`, `drop`       | ✅       | `stage`                  |
+| `m2repo-path`         | Path to local Maven repo directory (for `stage` mode)     | ❌       | `m2repo`                 |
+| `staging-repo-id`     | Existing staging repo ID (for `close`/`release`/`drop`)   | ❌       | —                        |
+| `description`         | Description for the staging repository                    | ❌       | `GitHub Actions staging` |
+| `close-timeout`       | Seconds to wait for a close to finish (`stage`/`close`)   | ❌       | `600`                    |
+| `close-poll-interval` | Seconds between close status checks (`stage`/`close`)     | ❌       | `10`                     |
 
 <!-- markdownlint-enable MD013 MD060 -->
+
+`close-timeout` and `close-poll-interval` take whole seconds from 1 to
+86400 (one day); the action rejects any other value before contacting
+Nexus.
 
 ## Outputs
 
@@ -196,11 +207,48 @@ jobs:
 1. **Create** — POST to `/staging/profiles/{id}/start` to open a new
    staging repository
 2. **Upload** — PUT each file from `m2repo-path` to
-   `/staging/deployByRepositoryId/{repo-id}/{relative-path}`
+   `/staging/deployByRepositoryId/{repo-id}/{relative-path}`. Any failed
+   upload fails the step before the close, as does an `m2repo-path` with
+   no files, so Nexus never closes an incomplete repository
 3. **Close** — POST to `/staging/profiles/{id}/finish` to close the
-   repository and trigger Nexus validation rules
+   repository and trigger Nexus validation rules, then wait for Nexus to
+   finish (see [Waiting for a close](#waiting-for-a-close))
 4. Writes `archives/staging-repo.txt` in JJB-compatible format:
    `{repo-id} {repo-url}`
+
+If the step fails after creating the staging repository (a failed upload,
+a staging rule failure, a timeout), the action logs the repository ID and
+drops the repository, so failed runs leave no open repositories behind.
+The drop makes a best effort: when Nexus refuses it, or does not answer
+within 30 seconds (or `close-timeout`, when that is shorter), the action
+logs a warning naming the repository to drop by hand, and the step still
+fails with the original error.
+
+### Waiting for a close
+
+Nexus 2 closes a repository asynchronously and runs its staging rules
+(signatures, POM and checksum checks) while doing so. After the `finish`
+request succeeds, stage and close modes poll
+`GET /staging/repository/{repo-id}` every `close-poll-interval` seconds:
+
+- `<type>closed</type>` with `<transitioning>false</transitioning>`: the
+  close succeeded
+- a `ruleFailed` or `repositoryCloseFailed` event in the activity of this
+  close attempt: the step fails, reporting each failing rule message the
+  activity records. Failures of earlier close attempts on the same
+  repository do not count, so closing again after a failed close can
+  succeed. Release mode still refuses such a repository (see
+  [Release Flow](#release-flow))
+- still not closed after `close-timeout` seconds: the step fails. The time
+  left bounds each status request and pause, so an unresponsive Nexus
+  cannot hold the step past the timeout
+
+`close-timeout` also bounds each request made before the polling
+starts: close mode's lookup of the repository and the `finish` request.
+
+The 600-second default gives Nexus room to run the staging rules over
+a large repository while stopping a stuck close from holding a runner for
+the 30 minutes release mode allows for a release.
 
 ### Release Flow
 
@@ -208,7 +256,10 @@ Ports `lftools nexus release`:
 
 1. **Verify** — GET `/staging/repository/{repo-id}/activity` to confirm the
    repository is in a closed state; fail on `ruleFailed` or
-   `repositoryCloseFailed`; skip if already `repositoryReleased`
+   `repositoryCloseFailed`; skip if already `repositoryReleased`. Like
+   lftools, this checks every close attempt in the activity log, so a
+   repository that failed a close once stays unreleasable even after a
+   later close succeeds: stage a fresh repository instead
 2. **Release** — POST to `/staging/bulk/promote` with the JSON payload
    `{"data":{"stagedRepositoryIds":["repo-id"]}}` (expects HTTP 201)
 3. **Poll** — GET the activity endpoint until `repositoryReleased`
@@ -216,12 +267,19 @@ Ports `lftools nexus release`:
 ### Close Operation
 
 - POST to `/staging/profiles/{id}/finish` to close an
-  opened staging repository
+  opened staging repository, then wait for the result as described in
+  [Waiting for a close](#waiting-for-a-close). Close mode first reads the
+  repository activity to count earlier close attempts, and fails without
+  requesting the close when it cannot. Close mode never drops a
+  repository whose close fails
 
 ### Drop Operation
 
 - POST to `/staging/profiles/{id}/drop` to delete the staging
   repository (useful for cleanup on failure)
+
+Close and drop fail the step unless Nexus answers the POST with an HTTP
+2xx status, and log the response body when it does not.
 
 ## Comparison with lftools
 

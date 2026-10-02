@@ -298,3 +298,675 @@ jobs:
           echo "PASS: release flow matches lftools nexus release"
         env:
           STEPS_RELEASE_OUTCOME: ${{ steps.release.outcome }}
+
+  ### Mocked stage, close and drop flows ###
+  test-stage-mock:
+    name: 'Test: Stage, close and drop against mock Nexus'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      MOCK_LOG: '/tmp/nexus_requests.log'
+      MOCK_PORT: '8089'
+      MOCK_REPO_ID: 'mock-repo-1001'
+      # XML special characters, which must reach Nexus escaped
+      DESCRIPTION: 'Build <&> "quoted" ''single'''
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Start mock Nexus server'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          python3 tests/mock_nexus.py > /tmp/mock.out 2>&1 &
+          # Wait for the server to accept connections
+          BASE="http://127.0.0.1:${MOCK_PORT}/service/local/staging"
+          ACT="${BASE}/repository/${MOCK_REPO_ID}/activity"
+          for _ in $(seq 1 20); do
+            if curl -sf "${ACT}" > /dev/null 2>&1; then
+              echo "INFO: mock-nexus is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::mock-nexus did not start"
+          cat /tmp/mock.out || true
+          exit 1
+
+      - name: 'Create test m2repo'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          DIR="m2repo/org/example/demo/1.0.0"
+          mkdir -p "${DIR}"
+          for ext in jar pom jar.asc; do
+            echo "demo ${ext}" > "${DIR}/demo-1.0.0.${ext}"
+          done
+
+      - name: 'Run action in stage mode against mock'
+        id: stage
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'mock-profile'
+          mode: 'stage'
+          m2repo-path: 'm2repo'
+          description: ${{ env.DESCRIPTION }}
+          close-poll-interval: '1'
+
+      - name: 'Open staging repositories for close mode'
+        id: open
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          BASE="http://127.0.0.1:${MOCK_PORT}/service/local/staging"
+          open_repo() {
+            local xml response
+            xml="<promoteRequest><data><description>close test"
+            xml+="</description></data></promoteRequest>"
+            response=$(curl -sf -H 'Content-Type: application/xml' \
+              -d "${xml}" "${BASE}/profiles/$1/start")
+            echo "${response}" \
+              | sed -n 's:.*<stagedRepositoryId>\([^<]*\)<.*:\1:p'
+          }
+          REPO_ID=$(open_repo mock-profile)
+          RETRY_ID=$(open_repo rule-once)
+          echo "repo_id=${REPO_ID}" >> "$GITHUB_OUTPUT"
+          echo "retry_id=${RETRY_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: 'Run action in close mode against mock'
+        id: close
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'mock-profile'
+          mode: 'close'
+          staging-repo-id: ${{ steps.open.outputs.repo_id }}
+          description: ${{ env.DESCRIPTION }}
+          close-poll-interval: '1'
+
+      - name: 'Close a repository whose first close fails (expect failure)'
+        id: close-first
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'rule-once'
+          mode: 'close'
+          staging-repo-id: ${{ steps.open.outputs.retry_id }}
+          close-poll-interval: '1'
+
+      - name: 'Close it again after the failed attempt'
+        id: close-retry
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'rule-once'
+          mode: 'close'
+          staging-repo-id: ${{ steps.open.outputs.retry_id }}
+          close-poll-interval: '1'
+
+      - name: 'Run action in drop mode against mock'
+        id: drop
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'mock-profile'
+          mode: 'drop'
+          staging-repo-id: ${{ steps.stage.outputs.staging_repo_id }}
+          description: ${{ env.DESCRIPTION }}
+
+      - name: 'Assert request flow'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+
+          echo "---> Recorded requests:"
+          cat "${MOCK_LOG}"
+
+          FAILED=0
+          fail() {
+            echo "::error::$*"
+            FAILED=1
+          }
+
+          # 1. Every action step succeeded.
+          [ "${STAGE_OUTCOME}" = "success" ] || fail "stage step failed"
+          [ "${CLOSE_OUTCOME}" = "success" ] || fail "close step failed"
+          [ "${DROP_OUTCOME}" = "success" ] || fail "drop step failed"
+
+          # 2. Stage reports the repository it created.
+          STAGED="mock-profile-1001"
+          if [ "${STAGED_ID}" != "${STAGED}" ]; then
+            fail "staging_repo_id is '${STAGED_ID}', want '${STAGED}'"
+          fi
+          LINE="${STAGED} http://127.0.0.1:8089/content/repositories/${STAGED}"
+          if ! grep -qxF "${LINE}" archives/staging-repo.txt; then
+            fail "archives/staging-repo.txt lacks '${LINE}'"
+          fi
+
+          # 3. Stage uploaded every artifact.
+          PUTS=$(grep -c "^PUT .*/deployByRepositoryId/${STAGED}/" \
+            "${MOCK_LOG}" || true)
+          [ "${PUTS}" -eq 3 ] || fail "expected 3 uploads, saw ${PUTS}"
+
+          # 4. Descriptions reached Nexus as well-formed XML that decodes
+          #    back to the original text, in stage, close and drop modes.
+          for want in \
+              "start  description=${DESCRIPTION}" \
+              "finish ${STAGED} description=Close: ${DESCRIPTION}" \
+              "finish ${OPENED} description=Close: ${DESCRIPTION}" \
+              "drop ${STAGED} description=Drop: ${DESCRIPTION}"; do
+            if ! grep -qxF "PARSED ${want}" "${MOCK_LOG}"; then
+              fail "mock did not receive: ${want}"
+            fi
+          done
+
+          # 5. Stage and close mode polled the status until it closed.
+          for rid in "${STAGED}" "${OPENED}"; do
+            POLLS=$(grep -c "^GET .*/repository/${rid}\$" \
+              "${MOCK_LOG}" || true)
+            if [ "${POLLS}" -lt 2 ]; then
+              fail "expected 2+ status checks of ${rid}, saw ${POLLS}"
+            fi
+          done
+
+          # 6. A successful stage drops nothing; the drop step drops once.
+          DROPS=$(grep -c "^PARSED drop " "${MOCK_LOG}" || true)
+          [ "${DROPS}" -eq 1 ] || fail "expected 1 drop, saw ${DROPS}"
+
+          # 7. A close retried after a failed attempt succeeds: the
+          #    earlier attempt's rule failure does not count against it.
+          if [ "${CLOSE_FIRST_OUTCOME}" != "failure" ]; then
+            fail "first close of ${RETRY} ended '${CLOSE_FIRST_OUTCOME}'"
+          fi
+          if [ "${CLOSE_RETRY_OUTCOME}" != "success" ]; then
+            fail "retried close of ${RETRY} failed"
+          fi
+
+          if [ "${FAILED}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "PASS: stage, close and drop flows wait and escape XML"
+        env:
+          STAGE_OUTCOME: ${{ steps.stage.outcome }}
+          CLOSE_OUTCOME: ${{ steps.close.outcome }}
+          DROP_OUTCOME: ${{ steps.drop.outcome }}
+          CLOSE_FIRST_OUTCOME: ${{ steps.close-first.outcome }}
+          CLOSE_RETRY_OUTCOME: ${{ steps.close-retry.outcome }}
+          STAGED_ID: ${{ steps.stage.outputs.staging_repo_id }}
+          OPENED: ${{ steps.open.outputs.repo_id }}
+          RETRY: ${{ steps.open.outputs.retry_id }}
+
+  ### Mocked stage and close failures ###
+  test-stage-failure-mock:
+    name: 'Test: Stage and close failures against mock Nexus'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      MOCK_LOG: '/tmp/nexus_requests.log'
+      MOCK_PORT: '8089'
+      MOCK_REPO_ID: 'mock-repo-1001'
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Start mock Nexus server'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          python3 tests/mock_nexus.py > /tmp/mock.out 2>&1 &
+          # Wait for the server to accept connections
+          BASE="http://127.0.0.1:${MOCK_PORT}/service/local/staging"
+          ACT="${BASE}/repository/${MOCK_REPO_ID}/activity"
+          for _ in $(seq 1 20); do
+            if curl -sf "${ACT}" > /dev/null 2>&1; then
+              echo "INFO: mock-nexus is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::mock-nexus did not start"
+          cat /tmp/mock.out || true
+          exit 1
+
+      - name: 'Create test m2repo and an empty m2repo'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          DIR="m2repo/org/example/demo/1.0.0"
+          mkdir -p "${DIR}" empty-m2repo
+          for ext in jar pom jar.asc; do
+            echo "demo ${ext}" > "${DIR}/demo-1.0.0.${ext}"
+          done
+
+      - name: 'Stage with one failing upload (expect failure)'
+        id: upload-fail
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'upload-fail'
+          mode: 'stage'
+          m2repo-path: 'm2repo'
+          close-poll-interval: '1'
+
+      - name: 'Stage with a failing staging rule (expect failure)'
+        id: rule-fail
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'rule-fail'
+          mode: 'stage'
+          m2repo-path: 'm2repo'
+          close-poll-interval: '1'
+
+      - name: 'Stage with a close that never finishes (expect failure)'
+        id: close-hang
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'close-hang'
+          mode: 'stage'
+          m2repo-path: 'm2repo'
+          close-timeout: '3'
+          close-poll-interval: '1'
+
+      - name: 'Stage an empty m2repo (expect failure)'
+        id: empty
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'empty-repo'
+          mode: 'stage'
+          m2repo-path: 'empty-m2repo'
+
+      - name: 'Record the time before an unresponsive status check'
+        id: hang-start
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: 'Stage while status checks hang (expect failure)'
+        id: status-hang
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'status-hang'
+          mode: 'stage'
+          m2repo-path: 'm2repo'
+          close-timeout: '3'
+          close-poll-interval: '1'
+
+      - name: 'Record the time after an unresponsive status check'
+        id: hang-end
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: 'Stage with a failed upload and a hanging drop (expect failure)'
+        id: drop-hang
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'drop-hang'
+          mode: 'stage'
+          m2repo-path: 'm2repo'
+          close-timeout: '3'
+
+      - name: 'Record the time after a hanging cleanup drop'
+        id: drop-hang-end
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: 'Open staging repositories for close mode'
+        id: open
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          BASE="http://127.0.0.1:${MOCK_PORT}/service/local/staging"
+          open_repo() {
+            local xml response
+            xml="<promoteRequest><data><description>close test"
+            xml+="</description></data></promoteRequest>"
+            response=$(curl -sf -H 'Content-Type: application/xml' \
+              -d "${xml}" "${BASE}/profiles/$1/start")
+            echo "${response}" \
+              | sed -n 's:.*<stagedRepositoryId>\([^<]*\)<.*:\1:p'
+          }
+          REPO_ID=$(open_repo rule-fail)
+          ACTIVITY_ERROR_ID=$(open_repo activity-error)
+          VERIFY_HANG_ID=$(open_repo verify-hang)
+          {
+            echo "repo_id=${REPO_ID}"
+            echo "activity_error_id=${ACTIVITY_ERROR_ID}"
+            echo "verify_hang_id=${VERIFY_HANG_ID}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Close with a failing staging rule (expect failure)'
+        id: close-rule-fail
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'rule-fail'
+          mode: 'close'
+          staging-repo-id: ${{ steps.open.outputs.repo_id }}
+          close-poll-interval: '1'
+
+      - name: 'Close with an unreadable activity log (expect failure)'
+        id: activity-error
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'activity-error'
+          mode: 'close'
+          staging-repo-id: ${{ steps.open.outputs.activity_error_id }}
+          close-poll-interval: '1'
+
+      - name: 'Record the time before a hanging repository lookup'
+        id: verify-hang-start
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: 'Close while the repository lookup hangs (expect failure)'
+        id: verify-hang
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'verify-hang'
+          mode: 'close'
+          staging-repo-id: ${{ steps.open.outputs.verify_hang_id }}
+          close-timeout: '3'
+
+      - name: 'Record the time after a hanging repository lookup'
+        id: verify-hang-end
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: 'Close with an overflowing close-timeout (expect failure)'
+        id: timeout-overflow
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'mock-profile'
+          mode: 'close'
+          staging-repo-id: ${{ env.MOCK_REPO_ID }}
+          dry-run: 'true'
+          # 2^64 + 1, which Bash arithmetic wraps to 1
+          close-timeout: '18446744073709551617'
+
+      - name: 'Close with close-poll-interval above 86400 (expect failure)'
+        id: interval-over
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'mock-profile'
+          mode: 'close'
+          staging-repo-id: ${{ env.MOCK_REPO_ID }}
+          dry-run: 'true'
+          close-poll-interval: '86401'
+
+      - name: 'Close with both timing inputs at 86400 (expect success)'
+        id: timing-max
+        continue-on-error: true
+        uses: $/
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'mock-profile'
+          mode: 'close'
+          staging-repo-id: ${{ env.MOCK_REPO_ID }}
+          dry-run: 'true'
+          close-timeout: '86400'
+          close-poll-interval: '86400'
+
+      - name: 'Assert failures and cleanup'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+
+          echo "---> Recorded requests:"
+          cat "${MOCK_LOG}"
+
+          FAILED=0
+          fail() {
+            echo "::error::$*"
+            FAILED=1
+          }
+          seen() {
+            grep -q "$1" "${MOCK_LOG}"
+          }
+          count() {
+            grep -c "$1" "${MOCK_LOG}" || true
+          }
+
+          # 1. Every scenario failed its step.
+          for outcome in \
+              "upload-fail=${UPLOAD_FAIL_OUTCOME}" \
+              "rule-fail=${RULE_FAIL_OUTCOME}" \
+              "close-hang=${CLOSE_HANG_OUTCOME}" \
+              "empty=${EMPTY_OUTCOME}" \
+              "status-hang=${STATUS_HANG_OUTCOME}" \
+              "drop-hang=${DROP_HANG_OUTCOME}" \
+              "close-rule-fail=${CLOSE_RULE_FAIL_OUTCOME}" \
+              "activity-error=${ACTIVITY_ERROR_OUTCOME}" \
+              "verify-hang=${VERIFY_HANG_OUTCOME}" \
+              "timeout-overflow=${TIMEOUT_OVERFLOW_OUTCOME}" \
+              "interval-over=${INTERVAL_OVER_OUTCOME}"; do
+            if [ "${outcome#*=}" != "failure" ]; then
+              fail "step ${outcome%%=*} ended '${outcome#*=}', want failure"
+            fi
+          done
+
+          # 2. A failed upload stops the stage before close, and the
+          #    stage drops the incomplete repository.
+          if ! seen "^PUT .*/deployByRepositoryId/upload-fail-.*\.pom\$"; then
+            fail "upload-fail: the .pom upload never happened"
+          fi
+          if seen "^POST .*/profiles/upload-fail/finish "; then
+            fail "upload-fail: closed a repository missing files"
+          fi
+          if ! seen "^PARSED drop upload-fail-"; then
+            fail "upload-fail: did not drop the incomplete repository"
+          fi
+
+          # 3. A staging rule failure during close fails the stage, which
+          #    then drops the repository.
+          POLLS=$(count "^GET .*/repository/rule-fail-[0-9]*\$")
+          if [ "${POLLS}" -lt 2 ]; then
+            fail "rule-fail: expected 2+ status checks, saw ${POLLS}"
+          fi
+          if [ "$(count "^PARSED drop rule-fail-")" -ne 1 ]; then
+            fail "rule-fail: expected one drop of the staged repository"
+          fi
+
+          # 4. A close that never finishes times out, and the failed drop
+          #    attempt (Nexus refuses it while transitioning) does not
+          #    mask the timeout.
+          POLLS=$(count "^GET .*/repository/close-hang-[0-9]*\$")
+          if [ "${POLLS}" -lt 2 ]; then
+            fail "close-hang: expected 2+ status checks, saw ${POLLS}"
+          fi
+          if ! seen "^POST .*/profiles/close-hang/drop "; then
+            fail "close-hang: did not try to drop the repository"
+          fi
+
+          # 5. An empty m2repo fails before any repository exists.
+          if seen "^POST .*/profiles/empty-repo/start "; then
+            fail "empty: created a staging repository for no files"
+          fi
+
+          # 6. close-timeout bounds a status check that never answers (the
+          #    mock holds it for 60s), and the stage still drops its
+          #    repository.
+          ELAPSED=$((HANG_END - HANG_START))
+          if [ "${ELAPSED}" -gt 20 ]; then
+            fail "status-hang: took ${ELAPSED}s with close-timeout 3"
+          fi
+          if ! seen "^PARSED drop status-hang-"; then
+            fail "status-hang: did not drop the repository"
+          fi
+
+          # 7. The cleanup drop gives up when Nexus never answers it (the
+          #    mock holds it for 60s): close-timeout 3 caps it below its
+          #    usual 30s, and the step still fails with the upload error.
+          ELAPSED=$((DROP_HANG_END - HANG_END))
+          if [ "${ELAPSED}" -gt 20 ]; then
+            fail "drop-hang: took ${ELAPSED}s with close-timeout 3"
+          fi
+          if ! seen "^PARSED drop drop-hang-"; then
+            fail "drop-hang: did not try to drop the repository"
+          fi
+
+          # 8. Close mode waits for the result and fails on a rule
+          #    failure, leaving the repository it did not create alone.
+          if ! seen "^PARSED finish ${OPENED} "; then
+            fail "close-rule-fail: never requested the close"
+          fi
+          POLLS=$(count "^GET .*/repository/${OPENED}\$")
+          if [ "${POLLS}" -lt 2 ]; then
+            fail "close-rule-fail: expected 2+ status checks, saw ${POLLS}"
+          fi
+          if seen "^PARSED drop ${OPENED} "; then
+            fail "close-rule-fail: dropped a repository it did not create"
+          fi
+
+          # 9. Close mode does not request a close when it cannot read
+          #    the earlier close attempts.
+          if seen "^PARSED finish ${ACTIVITY_ERROR_ID} "; then
+            fail "activity-error: requested the close without a baseline"
+          fi
+
+          # 10. No failed stage reported a staging repository.
+          if [ -e archives/staging-repo.txt ]; then
+            fail "a failed stage wrote archives/staging-repo.txt"
+          fi
+
+          # 11. close-timeout also bounds close mode's first lookup of the
+          #     repository (the mock holds it for 60s), and the close is
+          #     never requested.
+          ELAPSED=$((VERIFY_HANG_END - VERIFY_HANG_START))
+          if [ "${ELAPSED}" -gt 20 ]; then
+            fail "verify-hang: took ${ELAPSED}s with close-timeout 3"
+          fi
+          if seen "^PARSED finish ${VERIFY_HANG_ID} "; then
+            fail "verify-hang: requested the close after a failed lookup"
+          fi
+
+          # 12. Timing inputs outside 1..86400 fail validation before any
+          #     request, including one whose arithmetic would overflow;
+          #     86400 itself is accepted, and only that run reaches Nexus.
+          if [ "${TIMING_MAX_OUTCOME}" != "success" ]; then
+            fail "timing-max: ended '${TIMING_MAX_OUTCOME}', want success"
+          fi
+          LOOKUPS=$(count "^GET .*/repository/${MOCK_REPO_ID}\$")
+          if [ "${LOOKUPS}" -ne 1 ]; then
+            fail "timing inputs: expected 1 status check, saw ${LOOKUPS}"
+          fi
+
+          if [ "${FAILED}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "PASS: failed uploads, rules and timeouts fail the step"
+        env:
+          UPLOAD_FAIL_OUTCOME: ${{ steps.upload-fail.outcome }}
+          RULE_FAIL_OUTCOME: ${{ steps.rule-fail.outcome }}
+          CLOSE_HANG_OUTCOME: ${{ steps.close-hang.outcome }}
+          EMPTY_OUTCOME: ${{ steps.empty.outcome }}
+          STATUS_HANG_OUTCOME: ${{ steps.status-hang.outcome }}
+          DROP_HANG_OUTCOME: ${{ steps.drop-hang.outcome }}
+          CLOSE_RULE_FAIL_OUTCOME: ${{ steps.close-rule-fail.outcome }}
+          ACTIVITY_ERROR_OUTCOME: ${{ steps.activity-error.outcome }}
+          VERIFY_HANG_OUTCOME: ${{ steps.verify-hang.outcome }}
+          VERIFY_HANG_START: ${{ steps.verify-hang-start.outputs.epoch }}
+          VERIFY_HANG_END: ${{ steps.verify-hang-end.outputs.epoch }}
+          VERIFY_HANG_ID: ${{ steps.open.outputs.verify_hang_id }}
+          TIMEOUT_OVERFLOW_OUTCOME: ${{ steps.timeout-overflow.outcome }}
+          INTERVAL_OVER_OUTCOME: ${{ steps.interval-over.outcome }}
+          TIMING_MAX_OUTCOME: ${{ steps.timing-max.outcome }}
+          HANG_START: ${{ steps.hang-start.outputs.epoch }}
+          HANG_END: ${{ steps.hang-end.outputs.epoch }}
+          DROP_HANG_END: ${{ steps.drop-hang-end.outputs.epoch }}
+          OPENED: ${{ steps.open.outputs.repo_id }}
+          ACTIVITY_ERROR_ID: ${{ steps.open.outputs.activity_error_id }}
