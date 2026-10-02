@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Tool configuration only. This repository is a GitHub Action, not a
+# Python package: there is no [project] table, and nothing builds or
+# installs it.
+
+[tool.basedpyright]
+# No requires-python exists to read. The testing workflow runs
+# tests/mock_nexus.py under the system python3 of ubuntu-latest, which is
+# ubuntu-24.04 and ships Python 3.12.
+pythonVersion = "3.12"
+pythonPlatform = "All"
+# basedpyright's own default, kept explicit. The bare hook already
+# enforced it, and it is stricter than the organisation's "standard".
+typeCheckingMode = "recommended"
+# The directories the pre-commit hook passes as explicit targets, so a
+# bare basedpyright run or an editor's language server analyses the same
+# set.
+include = ["tests"]
+
+[tool.mypy]
+# The pre-commit mypy hook otherwise targets whichever Python runs it,
+# and Python 3.11 has no typing.override. Pin the same target as above.
+python_version = "3.12"
