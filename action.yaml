@@ -49,6 +49,19 @@ inputs:
     description: 'Description for the staging repository'
     required: false
     default: 'GitHub Actions staging'
+  close-timeout:
+    description: >
+      Seconds to wait for Nexus to finish closing a staging repository
+      (stage and close modes) before failing the step, from 1 to 86400.
+      Also caps the 30s limit on the drop a failed stage makes.
+    required: false
+    default: '600'
+  close-poll-interval:
+    description: >
+      Seconds between checks of the close status (stage and close modes),
+      from 1 to 86400.
+    required: false
+    default: '10'
 
 outputs:
   staging_repo_id:
@@ -69,6 +82,8 @@ runs:
         INPUT_STAGING_REPO_ID: ${{ inputs.staging-repo-id }}
         INPUT_STAGING_REPO_FILE: ${{ inputs.staging-repo-file }}
         INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_CLOSE_TIMEOUT: ${{ inputs.close-timeout }}
+        INPUT_CLOSE_POLL_INTERVAL: ${{ inputs.close-poll-interval }}
       run: |
         # SPDX-License-Identifier: Apache-2.0
         set -euo pipefail
@@ -95,6 +110,27 @@ runs:
             exit 1
             ;;
         esac
+
+        # Accept 1..86400. Check the digit count before any arithmetic:
+        # Bash wraps at 2^64, so a huge value would otherwise pass as a
+        # small one (18446744073709551617 evaluates to 1).
+        require_positive_integer() {
+          local digits="${2#"${2%%[!0]*}"}"
+          case "$2" in
+            ''|*[!0-9]*) ;;
+            *)
+              if [ -n "$digits" ] && [ "${#digits}" -le 5 ] \
+                  && [ "$((10#$digits))" -le 86400 ]; then
+                return 0
+              fi
+              ;;
+          esac
+          echo "::error::Invalid $1: $2 (must be an integer from 1 to 86400)"
+          exit 1
+        }
+        require_positive_integer close-timeout "$INPUT_CLOSE_TIMEOUT"
+        require_positive_integer close-poll-interval \
+          "$INPUT_CLOSE_POLL_INTERVAL"
 
         if [ "$INPUT_MODE" = "stage" ]; then
           if [ ! -d "$INPUT_M2REPO_PATH" ]; then
@@ -138,6 +174,8 @@ runs:
         INPUT_STAGING_REPO_FILE: ${{ inputs.staging-repo-file }}
         INPUT_DRY_RUN: ${{ inputs.dry-run }}
         INPUT_DESCRIPTION: ${{ inputs.description }}
+        INPUT_CLOSE_TIMEOUT: ${{ inputs.close-timeout }}
+        INPUT_CLOSE_POLL_INTERVAL: ${{ inputs.close-poll-interval }}
       run: |
         # SPDX-License-Identifier: Apache-2.0
         set -euo pipefail
@@ -156,6 +194,8 @@ runs:
         AUTH="${INPUT_NEXUS_USERNAME}:${INPUT_NEXUS_PASSWORD}"
         PROFILE_ID="${INPUT_STAGING_PROFILE_ID}"
         STAGING_API="${NEXUS_SERVER}/service/local/staging"
+        CLOSE_TIMEOUT=$((10#${INPUT_CLOSE_TIMEOUT}))
+        CLOSE_POLL_INTERVAL=$((10#${INPUT_CLOSE_POLL_INTERVAL}))
 
         # Build list of staging repo IDs from explicit id and/or file.
         # The file format matches stage-mode output: "REPO_ID REPO_URL".
@@ -177,6 +217,203 @@ runs:
             fi
         }
 
+        # Escape the XML special characters & < > " ' in $1.
+        xml_escape() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' \
+                -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+        }
+
+        # Send a request to Nexus. Arguments: URL, then extra curl options.
+        # Sets HTTP_CODE ("000" when no response arrived) and HTTP_BODY.
+        nexus_request() {
+            local url="$1" response
+            shift
+            response=$(curl -s -u "$AUTH" -w '\n%{http_code}' "$@" "$url") \
+                || true
+            HTTP_CODE="${response##*$'\n'}"
+            HTTP_BODY="${response%$'\n'*}"
+        }
+
+        # POST a promoteRequest to /profiles/<id>/<op> (op: finish or drop)
+        # for repository $2 with description $3; any further arguments are
+        # extra curl options. Succeeds on HTTP 2xx.
+        staging_profile_op() {
+            local op="$1" rid="$2" desc="$3" xml
+            shift 3
+            xml="<promoteRequest><data>"
+            xml+="<stagedRepositoryId>$(xml_escape "$rid")</stagedRepositoryId>"
+            xml+="<description>$(xml_escape "$desc")</description>"
+            xml+="</data></promoteRequest>"
+            nexus_request "${STAGING_API}/profiles/${PROFILE_ID}/${op}" \
+                -H "Content-Type: application/xml" -d "$xml" "$@"
+            case "$HTTP_CODE" in
+                2??) return 0 ;;
+            esac
+            echo "Response: ${HTTP_BODY:0:500}"
+            return 1
+        }
+
+        # Print, one per line, each close activity in the activity XML $1
+        # that comes after the first $2 close activities.
+        close_activities_after() {
+            printf '%s' "$1" | tr '\r\n' '  ' | awk -v skip="$2" '
+                BEGIN { RS = "<stagingActivity>" }
+                NR > 1 && /^[[:space:]]*<name>close<\/name>/ {
+                    if (++seen > skip) print
+                }'
+        }
+
+        # Print the rule failure messages found in close activity XML $1.
+        report_rule_failures() {
+            local messages msg
+            messages=$(printf '%s' "$1" | grep -oE \
+                '<name>failureMessage</name>[[:space:]]*<value>[^<]*</value>' \
+                | sed -e 's:.*<value>::' -e 's:</value>$::' \
+                    -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' \
+                    -e "s/&apos;/'/g" -e 's/&amp;/\&/g' || true)
+            if [ -z "$messages" ]; then
+                echo "INFO: The activity log records no rule failure messages"
+                return 0
+            fi
+            while IFS= read -r msg; do
+                echo "::error::Staging rule failure: ${msg}"
+            done <<< "$messages"
+        }
+
+        # Wait for Nexus to finish closing repository $1, which closes
+        # asynchronously after /finish. $2 counts the close activities the
+        # repository had before the request: an earlier failed close attempt
+        # must not fail this one. Succeeds on type=closed with
+        # transitioning=false; fails on a rule or close failure or timeout.
+        # The time left before the deadline bounds every request and sleep,
+        # so a Nexus that stops answering cannot outlast close-timeout.
+        wait_for_close() {
+            local rid="$1" baseline="$2" deadline flat state transitioning
+            local attempts remaining
+            deadline=$((SECONDS + CLOSE_TIMEOUT))
+            echo "INFO: Waiting up to ${CLOSE_TIMEOUT}s for ${rid} to close"
+            while true; do
+                state="unknown"
+                transitioning="unknown"
+                remaining=$((deadline - SECONDS))
+                [ "$remaining" -gt 0 ] || remaining=1
+                nexus_request "${STAGING_API}/repository/${rid}" \
+                    -H "Accept: application/xml" --max-time "$remaining"
+                case "$HTTP_CODE" in
+                    200)
+                        flat=$(printf '%s' "$HTTP_BODY" | tr '\r\n' '  ')
+                        state=$(printf '%s' "$flat" \
+                            | sed -n 's:.*<type>\([^<]*\)</type>.*:\1:p')
+                        transitioning=$(printf '%s' "$flat" | sed -n \
+                            's:.*<transitioning>\([^<]*\)</transitioning>.*:\1:p')
+                        ;;
+                    404)
+                        echo "::error::Staging repository ${rid} not found" \
+                            "while waiting for it to close"
+                        return 1
+                        ;;
+                    *)
+                        echo "::warning::Status check of ${rid} returned" \
+                            "HTTP ${HTTP_CODE}; retrying"
+                        ;;
+                esac
+
+                if [ "$transitioning" = "false" ]; then
+                    if [ "$state" = "closed" ]; then
+                        echo "INFO: Staging repository ${rid} closed"
+                        return 0
+                    fi
+                    remaining=$((deadline - SECONDS))
+                    [ "$remaining" -gt 0 ] || remaining=1
+                    nexus_request "${STAGING_API}/repository/${rid}/activity" \
+                        -H "Accept: application/xml" --max-time "$remaining"
+                    if [ "$HTTP_CODE" = "200" ]; then
+                        attempts=$(close_activities_after "$HTTP_BODY" \
+                            "$baseline")
+                        case "$attempts" in
+                            *'<name>ruleFailed</name>'* \
+                            | *'<name>repositoryCloseFailed</name>'*)
+                                echo "::error::Nexus failed to close ${rid}:" \
+                                    "one or more staging rules failed"
+                                report_rule_failures "$attempts"
+                                return 1
+                                ;;
+                        esac
+                    fi
+                fi
+
+                if [ "$SECONDS" -ge "$deadline" ]; then
+                    echo "::error::Timed out after ${CLOSE_TIMEOUT}s waiting" \
+                        "for ${rid} to close (type=${state:-unknown}," \
+                        "transitioning=${transitioning:-unknown})"
+                    return 1
+                fi
+                remaining=$((deadline - SECONDS))
+                if [ "$remaining" -gt "$CLOSE_POLL_INTERVAL" ]; then
+                    remaining="$CLOSE_POLL_INTERVAL"
+                fi
+                echo "INFO: ${rid}: type=${state:-unknown}" \
+                    "transitioning=${transitioning:-unknown};" \
+                    "checking again in ${remaining}s"
+                sleep "$remaining"
+            done
+        }
+
+        # Request the close of repository $1 (description $2), then wait
+        # for Nexus to report the outcome. $3, when given, counts the earlier
+        # close attempts; otherwise read them from the activity log, and
+        # refuse to close when that fails rather than risk blaming this
+        # close for an earlier attempt's rule failures.
+        close_repository() {
+            local rid="$1" desc="$2" baseline="${3:-}"
+            if [ -z "$baseline" ]; then
+                nexus_request "${STAGING_API}/repository/${rid}/activity" \
+                    -H "Accept: application/xml" --max-time "$CLOSE_TIMEOUT"
+                if [ "$HTTP_CODE" != "200" ]; then
+                    echo "::error::Cannot read the activity of ${rid}" \
+                        "(HTTP ${HTTP_CODE}); not requesting its close"
+                    return 1
+                fi
+                baseline=$(close_activities_after "$HTTP_BODY" 0 | wc -l)
+                baseline=$((baseline))
+            fi
+            if ! staging_profile_op finish "$rid" "$desc" \
+                --max-time "$CLOSE_TIMEOUT"; then
+                echo "::error::Close request for ${rid} failed" \
+                    "(HTTP ${HTTP_CODE})"
+                return 1
+            fi
+            echo "INFO: Nexus accepted the close request for ${rid}"
+            wait_for_close "$rid" "$baseline"
+        }
+
+        # Stage mode sets this once it has created a staging repository and
+        # clears it on success. If the step fails while it is set, drop the
+        # repository so failed runs leave no open repositories behind. The
+        # drop gives up after 30s, or after close-timeout when that is
+        # shorter, and the original exit status survives whatever the drop
+        # does.
+        STAGED_REPO_ID=""
+        drop_failed_stage() {
+            local rc=$? drop_timeout=30
+            if [ "$rc" -ne 0 ] && [ -n "$STAGED_REPO_ID" ]; then
+                echo "INFO: Stage failed after creating staging repository" \
+                    "${STAGED_REPO_ID}; dropping it"
+                if [ "$CLOSE_TIMEOUT" -lt "$drop_timeout" ]; then
+                    drop_timeout="$CLOSE_TIMEOUT"
+                fi
+                if staging_profile_op drop "$STAGED_REPO_ID" \
+                    "Drop failed stage: ${INPUT_DESCRIPTION}" \
+                    --max-time "$drop_timeout"; then
+                    echo "INFO: Dropped staging repository ${STAGED_REPO_ID}"
+                else
+                    echo "::warning::Could not drop staging repository" \
+                        "${STAGED_REPO_ID} (HTTP ${HTTP_CODE}); drop it by hand"
+                fi
+            fi
+            exit "$rc"
+        }
+
         # ─── STAGE MODE ────────────────────────────────────────
         if [ "$INPUT_MODE" = "stage" ]; then
             echo "INFO: Creating staging repository..."
@@ -184,14 +421,23 @@ runs:
             # Step 1: Create staging repo
             XML_DATA="<promoteRequest><data>"
             XML_DATA+="<description>"
-            XML_DATA+="${INPUT_DESCRIPTION}"
+            XML_DATA+="$(xml_escape "${INPUT_DESCRIPTION}")"
             XML_DATA+="</description>"
             XML_DATA+="</data></promoteRequest>"
-            CREATE_RESPONSE=$(curl -sf -u "$AUTH" \
+            nexus_request "${STAGING_API}/profiles/${PROFILE_ID}/start" \
                 -H "Content-Type: application/xml" \
                 -H "Accept: application/xml" \
-                -d "$XML_DATA" \
-                "${STAGING_API}/profiles/${PROFILE_ID}/start")
+                -d "$XML_DATA"
+            CREATE_RESPONSE="$HTTP_BODY"
+            case "$HTTP_CODE" in
+                2??) ;;
+                *)
+                    echo "::error::Failed to create staging repository" \
+                        "(HTTP ${HTTP_CODE})"
+                    echo "Response: ${CREATE_RESPONSE:0:500}"
+                    exit 1
+                    ;;
+            esac
 
             REPO_ID=$(echo "$CREATE_RESPONSE" \
                 | grep -oP \
@@ -206,50 +452,41 @@ runs:
                 exit 1
             fi
             echo "INFO: Staging repository ${REPO_ID} created"
+            STAGED_REPO_ID="$REPO_ID"
+            trap drop_failed_stage EXIT
 
-            # Step 2: Upload artifacts
+            # Step 2: Upload artifacts. A staging repository missing files
+            # must never close, so the first failed upload fails the step.
             DEPLOY_URL="${NEXUS_SERVER}/service/local/staging"
             DEPLOY_URL+="/deployByRepositoryId/${REPO_ID}"
             UPLOAD_COUNT=0
-            UPLOAD_FAIL=0
 
             while IFS= read -r -d '' file; do
-                rel_path="${file#${INPUT_M2REPO_PATH}/}"
-                if curl -sf -u "$AUTH" \
-                    --upload-file "$file" \
-                    "${DEPLOY_URL}/${rel_path}"; then
-                    UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
-                else
-                    echo "::warning::Failed to upload: $rel_path"
-                    UPLOAD_FAIL=$((UPLOAD_FAIL + 1))
-                fi
+                rel_path="${file#"${INPUT_M2REPO_PATH}"/}"
+                nexus_request "${DEPLOY_URL}/${rel_path}" \
+                    --upload-file "$file"
+                case "$HTTP_CODE" in
+                    2??) UPLOAD_COUNT=$((UPLOAD_COUNT + 1)) ;;
+                    *)
+                        echo "::error::Failed to upload ${rel_path}" \
+                            "(HTTP ${HTTP_CODE})"
+                        exit 1
+                        ;;
+                esac
             done < <(find "$INPUT_M2REPO_PATH" -type f -print0)
 
-            echo "INFO: Uploaded ${UPLOAD_COUNT} files" \
-                "(${UPLOAD_FAIL} failures)"
+            echo "INFO: Uploaded ${UPLOAD_COUNT} files"
 
-            if [ "$UPLOAD_FAIL" -gt 0 ] && [ "$UPLOAD_COUNT" -eq 0 ]; then
-                echo "::error::All uploads failed"
+            if [ "$UPLOAD_COUNT" -eq 0 ]; then
+                echo "::error::No files to upload in ${INPUT_M2REPO_PATH}"
                 exit 1
             fi
 
-            # Step 3: Close staging repo
+            # Step 3: Close staging repo and wait for Nexus to finish. The
+            # repository is new, so it has no earlier close attempts.
             echo "INFO: Closing staging repository" \
                 "${REPO_ID}..."
-            CLOSE_XML="<promoteRequest><data>"
-            CLOSE_XML+="<stagedRepositoryId>"
-            CLOSE_XML+="${REPO_ID}"
-            CLOSE_XML+="</stagedRepositoryId>"
-            CLOSE_XML+="<description>"
-            CLOSE_XML+="Close: ${INPUT_DESCRIPTION}"
-            CLOSE_XML+="</description>"
-            CLOSE_XML+="</data></promoteRequest>"
-            curl -sf -u "$AUTH" \
-                -H "Content-Type: application/xml" \
-                -d "$CLOSE_XML" \
-                "${STAGING_API}/profiles/${PROFILE_ID}/finish"
-
-            echo "INFO: Staging repository ${REPO_ID} closed"
+            close_repository "$REPO_ID" "Close: ${INPUT_DESCRIPTION}" 0
 
             REPO_URL="${NEXUS_SERVER}/content/repositories/${REPO_ID}"
 
@@ -272,8 +509,8 @@ runs:
                 echo "| **Repo ID** | \`${REPO_ID}\` |"
                 echo "| **Repo URL** | ${REPO_URL} |"
                 echo "| **Files Uploaded** | ${UPLOAD_COUNT} |"
-                echo "| **Upload Failures** | ${UPLOAD_FAIL} |"
             } >> "$GITHUB_STEP_SUMMARY"
+            STAGED_REPO_ID=""
 
         # ─── RELEASE MODE (release closed repos) ──────────────────
         # Ports `lftools nexus release` (nexus/cmd.py release_staging_repos):
@@ -384,8 +621,8 @@ runs:
             build_repo_ids
 
             case "$INPUT_MODE" in
-                close) ACTION_VERB="Close"; API_OP="finish" ;;
-                drop)  ACTION_VERB="Drop";  API_OP="drop"   ;;
+                close) ACTION_VERB="Close" ;;
+                drop)  ACTION_VERB="Drop" ;;
             esac
 
             echo "INFO: ${ACTION_VERB} on ${#REPO_IDS[@]} repo(s)" \
@@ -393,31 +630,43 @@ runs:
 
             LAST_REPO_ID=""
             SUMMARY_ROWS=""
+            # close-timeout bounds every request close mode makes, this
+            # lookup included, so a Nexus that never answers cannot hang it.
+            VERIFY_LIMIT=()
+            if [ "$INPUT_MODE" = "close" ]; then
+                VERIFY_LIMIT=(--max-time "$CLOSE_TIMEOUT")
+            fi
             for RID in "${REPO_IDS[@]}"; do
                 echo "INFO: Verifying staging repository ${RID}..."
-                if ! curl -sf -u "$AUTH" \
+                VERIFY_RC=0
+                curl -sf -u "$AUTH" "${VERIFY_LIMIT[@]}" \
                     -H "Accept: application/xml" \
-                    "${STAGING_API}/repository/${RID}" > /dev/null; then
+                    "${STAGING_API}/repository/${RID}" > /dev/null \
+                    || VERIFY_RC=$?
+                if [ "$VERIFY_RC" -eq 28 ]; then
+                    echo "::error::Timed out after ${CLOSE_TIMEOUT}s looking" \
+                        "up staging repository ${RID}"
+                    exit 1
+                elif [ "$VERIFY_RC" -ne 0 ]; then
                     echo "::error::Staging repository not found: ${RID}"
                     exit 1
                 fi
 
                 if [ "$INPUT_DRY_RUN" = "true" ]; then
-                    echo "INFO: [dry-run] would ${API_OP} ${RID} (skipped)"
+                    echo "INFO: [dry-run] would ${INPUT_MODE} ${RID} (skipped)"
                     SUMMARY_ROWS+="| \`${RID}\` | verified (dry-run) |"$'\n'
+                elif [ "$INPUT_MODE" = "close" ]; then
+                    close_repository "$RID" "Close: ${INPUT_DESCRIPTION}"
+                    SUMMARY_ROWS+="| \`${RID}\` | closed |"$'\n'
                 else
-                    OP_XML="<promoteRequest><data>"
-                    OP_XML+="<stagedRepositoryId>${RID}</stagedRepositoryId>"
-                    OP_XML+="<description>"
-                    OP_XML+="${ACTION_VERB}: ${INPUT_DESCRIPTION}"
-                    OP_XML+="</description>"
-                    OP_XML+="</data></promoteRequest>"
-                    curl -sf -u "$AUTH" \
-                        -H "Content-Type: application/xml" \
-                        -d "$OP_XML" \
-                        "${STAGING_API}/profiles/${PROFILE_ID}/${API_OP}"
-                    echo "INFO: Staging repository ${RID} ${API_OP}d"
-                    SUMMARY_ROWS+="| \`${RID}\` | ${API_OP}d |"$'\n'
+                    if ! staging_profile_op drop "$RID" \
+                        "Drop: ${INPUT_DESCRIPTION}"; then
+                        echo "::error::Drop of ${RID} failed" \
+                            "(HTTP ${HTTP_CODE})"
+                        exit 1
+                    fi
+                    echo "INFO: Staging repository ${RID} dropped"
+                    SUMMARY_ROWS+="| \`${RID}\` | dropped |"$'\n'
                 fi
                 LAST_REPO_ID="${RID}"
             done
