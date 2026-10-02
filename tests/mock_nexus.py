@@ -59,7 +59,21 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TYPE_CHECKING, TypeVar, cast
 from xml.sax.saxutils import escape
+
+if TYPE_CHECKING:
+    from typing import override
+else:
+    try:
+        from typing import override
+    except ImportError:  # Python < 3.12: a no-op stand-in
+        _F = TypeVar("_F")
+
+        def override(func: _F) -> _F:
+            """Mark a method as overriding one in a base class."""
+            return func
+
 
 PORT = int(os.environ.get("MOCK_PORT", "8089"))
 LOG = os.environ.get("MOCK_LOG", "/tmp/nexus_requests.log")
@@ -302,15 +316,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _bulk_promote(self, body: str) -> None:
         try:
-            data = json.loads(body)  # pyright: ignore[reportAny]
-            ids = data["data"]["stagedRepositoryIds"]  # pyright: ignore[reportAny]
+            data = cast("dict[str, dict[str, object]]", json.loads(body))
+            ids = data["data"]["stagedRepositoryIds"]
         except (ValueError, KeyError):
             self._error(400, "Malformed JSON")
             return
         if not ids or not isinstance(ids, list):
             self._error(400, "No repositories named")
             return
-        repos = [REPOS.get(str(repo_id)) for repo_id in ids]  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+        repos = [REPOS.get(str(repo_id)) for repo_id in cast("list[object]", ids)]
         for repo in repos:
             if repo is None or repo.type != "closed":
                 self._error(400, "Repository missing or not closed")
@@ -321,7 +335,8 @@ class Handler(BaseHTTPRequestHandler):
                 repo.activities.append(("release", [("repositoryReleased", {})]))
         self._send(201)
 
-    def log_message(self, format: str, *args: object) -> None:  # pyright: ignore[reportImplicitOverride]
+    @override
+    def log_message(self, format: str, *args: object) -> None:
         return
 
 
